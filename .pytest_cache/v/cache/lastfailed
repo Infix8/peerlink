@@ -1,0 +1,3 @@
+{
+  "tests/test_channel_sequence_queue.py::test_bounded_queue_drop_oldest": true
+}
