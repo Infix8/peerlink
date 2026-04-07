@@ -47,7 +47,7 @@ __all__ = [
 # ─────────────────────────────────────────────────────────────────────────────
 # Constants
 # ─────────────────────────────────────────────────────────────────────────────
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 
 # mDNS service type for PeerLink nodes
 SERVICE_TYPE = "_peerlink._tcp.local."
@@ -164,6 +164,8 @@ class PeerInfo:
     ttl: float = PEER_TTL
     # Stable per-process identity from mDNS TXT; distinguishes restarts/collisions
     instance_id: Optional[str] = None
+    # Optional TCP port for streaming / file transfer (advertised via mDNS TXT).
+    tcp_port: Optional[int] = None
 
 
 @dataclass
@@ -404,12 +406,82 @@ class PeerProxy:
         return bool(res)
 
 
+class Stream:
+    """
+    TCP-backed stream used for long-lived byte streams (video, audio, files).
+
+    Provides basic frame-oriented helpers on top of a blocking socket using
+    a 4-byte big-endian length prefix for each frame.
+    """
+
+    def __init__(self, node: "PeerLink", sock: socket.socket, peer_name: str):
+        self._node = node
+        self._sock = sock
+        self._peer_name = peer_name
+        self._lock = threading.Lock()
+
+    @property
+    def peer_name(self) -> str:
+        return self._peer_name
+
+    def write(self, data: bytes) -> None:
+        with self._lock:
+            self._sock.sendall(data)
+
+    def read(self, n: int) -> bytes:
+        return self._sock.recv(n)
+
+    def write_frame(self, payload: bytes) -> None:
+        if not isinstance(payload, (bytes, bytearray)):
+            raise TypeError("Stream.write_frame expects bytes")
+        length = len(payload).to_bytes(4, "big")
+        with self._lock:
+            self._sock.sendall(length + payload)
+
+    def read_frame(self) -> bytes:
+        header = self._recv_exact(4)
+        if not header:
+            return b""
+        length = int.from_bytes(header, "big")
+        if length <= 0:
+            return b""
+        return self._recv_exact(length)
+
+    def _recv_exact(self, n: int) -> bytes:
+        buf = b""
+        while len(buf) < n:
+            chunk = self._sock.recv(n - len(buf))
+            if not chunk:
+                break
+            buf += chunk
+        return buf
+
+    def close(self) -> None:
+        try:
+            self._sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        self._sock.close()
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 def _node_port(node_name: str, realm: Optional[str] = None) -> int:
     """Deterministic, collision-resistant port from node name (and optional realm)."""
     key = node_name if not realm else f"{realm}|{node_name}"
+    digest = int(hashlib.md5(key.encode()).hexdigest(), 16)
+    return BASE_PORT + (digest % PORT_RANGE)
+
+
+def _node_tcp_port(node_name: str, realm: Optional[str] = None) -> int:
+    """
+    Deterministic TCP port for streaming / file transfer.
+
+    Uses a separate hash salt so UDP / TCP ports are stable but distinct, and
+    still stay within the dynamic range.
+    """
+    key = (node_name if not realm else f"{realm}|{node_name}") + "|tcp"
     digest = int(hashlib.md5(key.encode()).hexdigest(), 16)
     return BASE_PORT + (digest % PORT_RANGE)
 
@@ -516,7 +588,10 @@ class PeerLink:
         self.verbose = verbose
         self._secret = secret
         self._realm = _derive_realm(secret)
+        # UDP port for RPC and datagram channels
         self.port = _node_port(node_name, self._realm)
+        # TCP port for streaming and file transfer
+        self._tcp_port = _node_tcp_port(node_name, self._realm)
         # One UUID per PeerLink process; published in mDNS TXT for collision
         # resolution (same display name, different instance).
         self._instance_id = str(uuid.uuid4())
@@ -556,6 +631,13 @@ class PeerLink:
         self._zeroconf: Optional[Zeroconf] = None
         self._service_info: Optional[ServiceInfo] = None
         self._browser: Optional[ServiceBrowser] = None
+
+        # TCP streaming / file-transfer server
+        self._tcp_sock: Optional[socket.socket] = None
+        self._tcp_server_thread: Optional[threading.Thread] = None
+        self._stream_handlers: Dict[str, Callable[["Stream"], None]] = {}
+        # Registered file handlers: list of (prefix, root_dir)
+        self._file_roots: List[Tuple[str, str]] = []
 
         # Built-in ping (liveness + ARP fallback probe target)
         self._handlers["__ping__"] = lambda: {"ok": True, "time": time.time()}
@@ -637,9 +719,10 @@ class PeerLink:
           3. Launch ServiceBrowser for peer discovery
         """
         self._start_udp_server()
+        self._start_tcp_server()
         self._publish_mdns()
         self._start_discovery()
-        self._log(f"🚀 Node-{self.node_name} [{self.port}] online")
+        self._log(f"🚀 Node-{self.node_name} [udp={self.port} tcp={self._tcp_port}] online")
         return self
 
     def stop(self) -> None:
@@ -659,6 +742,8 @@ class PeerLink:
                 self._zeroconf.close()
             if self._sock:
                 self._sock.close()
+            if self._tcp_sock:
+                self._tcp_sock.close()
         except Exception as exc:  # pragma: no cover - defensive
             logger.warning("Shutdown error: %s", exc)
         self._log(f"🛑 Node-{self.node_name} stopped")
@@ -978,6 +1063,37 @@ class PeerLink:
         )
         self._log(f"UDP server bound on port {self.port}")
 
+    def _start_tcp_server(self) -> None:
+        """
+        Start TCP listener for streaming and file transfer.
+
+        If binding fails (e.g. port in use), log a warning and continue with
+        UDP-only mode so existing behavior is preserved.
+        """
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind(("", self._tcp_port))
+            sock.listen()
+            sock.settimeout(1.0)
+        except OSError as exc:
+            logger.warning(
+                "TCP server bind failed on port %s for node '%s': %s",
+                self._tcp_port,
+                self.node_name,
+                exc,
+            )
+            self._tcp_sock = None
+            return
+        self._tcp_sock = sock
+        self._tcp_server_thread = threading.Thread(
+            target=self._tcp_server_loop,
+            daemon=True,
+            name=f"peerlink-tcp-{self.node_name}",
+        )
+        self._tcp_server_thread.start()
+        self._log(f"TCP server bound on port {self._tcp_port}")
+
     def _server_loop(self) -> None:
         """Receive UDP packets in a tight loop."""
         while self._running:
@@ -1132,6 +1248,7 @@ class PeerLink:
             properties={
                 "node": self.node_name,
                 "port": str(self.port),
+                "tcp_port": str(self._tcp_port),
                 "version": __version__,
                 "instance_id": self._instance_id,
             },
@@ -1142,6 +1259,390 @@ class PeerLink:
     def _start_discovery(self) -> None:
         listener = _PeerListener(self)
         self._browser = ServiceBrowser(self._zeroconf, self._service_type(), listener)
+
+    # ── TCP Server: Streams + Files ──────────────────────────────────────────
+
+    def _tcp_server_loop(self) -> None:
+        if self._tcp_sock is None:
+            return
+        while self._running and self._tcp_sock is not None:
+            try:
+                conn, addr = self._tcp_sock.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            threading.Thread(
+                target=self._handle_tcp_connection,
+                args=(conn, addr),
+                daemon=True,
+            ).start()
+
+    def _handle_tcp_connection(self, conn: socket.socket, addr: Tuple[str, int]) -> None:
+        """
+        Demultiplex TCP connections between stream handshakes and minimal HTTP
+        (file transfer) based on the first bytes.
+        """
+        try:
+            conn.settimeout(5.0)
+            # Peek at first line
+            data = b""
+            while b"\n" not in data and len(data) < 4096:
+                chunk = conn.recv(1)
+                if not chunk:
+                    break
+                data += chunk
+            if not data:
+                conn.close()
+                return
+            first_line = data.splitlines()[0].strip()
+            if first_line.startswith(b"GET ") or first_line.startswith(b"PUT "):
+                self._handle_http_connection(conn, first_line, initial=data)
+            else:
+                self._handle_stream_connection(conn, first_line, initial=data)
+        except Exception:
+            conn.close()
+
+    # ── Stream API over TCP ──────────────────────────────────────────────────
+
+    def register_stream(
+        self,
+        name: str,
+        on_accept: Callable[["Stream"], None],
+    ) -> "PeerLink":
+        """
+        Register a named TCP stream endpoint.
+
+        The handler receives a ``Stream`` object backed by a TCP socket. It may
+        use ``read_frame`` / ``write_frame`` for length-prefixed framing.
+        """
+        self._stream_handlers[name] = on_accept
+        return self
+
+    def open_stream(
+        self,
+        peer_name: str,
+        stream_name: str,
+        *,
+        timeout: float = 5.0,
+    ) -> "Stream":
+        """
+        Open a TCP stream to ``peer_name`` and perform a simple JSON handshake.
+        """
+        peer_addr = self._resolve_peer(peer_name)
+        if peer_addr is None:
+            raise PeerNotFound(f"Peer '{peer_name}' not found for stream open")
+        addr, _ = peer_addr
+        peer_info = self._peers.get(peer_name)
+        tcp_port = None
+        if peer_info is not None and peer_info.tcp_port is not None:
+            tcp_port = peer_info.tcp_port
+        else:
+            tcp_port = _node_tcp_port(peer_name, self._realm)
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        s.connect((addr, tcp_port))
+        # Handshake: JSON line
+        hello = {
+            "type": "stream_open",
+            "name": stream_name,
+            "src": self.node_name,
+        }
+        s.sendall(json.dumps(hello).encode("utf-8") + b"\n")
+        # Optional ACK (ignored on timeout)
+        try:
+            ack = s.recv(1024)
+            if not ack:
+                raise PeerTimeoutError("Stream open did not receive ACK")
+        except socket.timeout:
+            raise PeerTimeoutError("Stream open did not receive ACK in time")
+        return Stream(self, s, peer_name)
+
+    def _handle_stream_connection(
+        self,
+        conn: socket.socket,
+        first_line: bytes,
+        initial: bytes,
+    ) -> None:
+        """
+        Handle an incoming stream handshake and dispatch to the registered
+        handler, if any.
+        """
+        try:
+            # first_line already read; for now assume it is entire JSON
+            try:
+                hello = json.loads(first_line.decode("utf-8"))
+            except Exception:
+                conn.close()
+                return
+            if hello.get("type") != "stream_open":
+                conn.close()
+                return
+            name = hello.get("name")
+            src = hello.get("src") or "peer"
+            handler = self._stream_handlers.get(name or "")
+            if handler is None:
+                conn.sendall(
+                    json.dumps(
+                        {
+                            "type": "stream_error",
+                            "error": f"No stream handler for '{name}'",
+                        }
+                    ).encode("utf-8")
+                    + b"\n"
+                )
+                conn.close()
+                return
+            # ACK
+            conn.sendall(
+                json.dumps({"type": "stream_ack", "name": name}).encode("utf-8")
+                + b"\n"
+            )
+            stream = Stream(self, conn, src)
+            try:
+                handler(stream)
+            finally:
+                stream.close()
+        except Exception:
+            conn.close()
+
+    # ── File transfer over TCP (minimal HTTP/1.1 subset) ─────────────────────
+
+    def register_file_handler(self, prefix: str, root_dir: str) -> "PeerLink":
+        """
+        Serve files under ``root_dir`` for HTTP requests whose path starts
+        with ``prefix``. Path traversal outside ``root_dir`` is rejected.
+        """
+        self._file_roots.append((prefix.rstrip("/") or "/", root_dir))
+        return self
+
+    def get_file(
+        self,
+        peer_name: str,
+        path: str,
+        *,
+        timeout: float = 10.0,
+    ) -> bytes:
+        peer_addr = self._resolve_peer(peer_name)
+        if peer_addr is None:
+            raise PeerNotFound(f"Peer '{peer_name}' not found for file GET")
+        addr, _ = peer_addr
+        peer_info = self._peers.get(peer_name)
+        tcp_port = None
+        if peer_info is not None and peer_info.tcp_port is not None:
+            tcp_port = peer_info.tcp_port
+        else:
+            tcp_port = _node_tcp_port(peer_name, self._realm)
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        s.connect((addr, tcp_port))
+        try:
+            req = f"GET {path} HTTP/1.1\r\nHost: {peer_name}\r\n\r\n".encode("utf-8")
+            s.sendall(req)
+            header = b""
+            while b"\r\n\r\n" not in header and len(header) < 65536:
+                chunk = s.recv(1024)
+                if not chunk:
+                    break
+                header += chunk
+            if not header:
+                raise RemoteError("Empty HTTP response")
+            head, _, rest = header.partition(b"\r\n\r\n")
+            status_line = head.splitlines()[0].decode("utf-8", errors="replace")
+            if "200" not in status_line:
+                raise RemoteError(f"HTTP error from peer: {status_line}")
+            content_length = 0
+            for line in head.splitlines()[1:]:
+                try:
+                    text = line.decode("utf-8")
+                except Exception:
+                    continue
+                if text.lower().startswith("content-length:"):
+                    try:
+                        content_length = int(text.split(":", 1)[1].strip())
+                    except ValueError:
+                        pass
+            body = rest
+            while len(body) < content_length:
+                chunk = s.recv(min(4096, content_length - len(body)))
+                if not chunk:
+                    break
+                body += chunk
+            return body
+        finally:
+            s.close()
+
+    def put_file(
+        self,
+        peer_name: str,
+        path: str,
+        data: bytes,
+        *,
+        timeout: float = 10.0,
+    ) -> None:
+        peer_addr = self._resolve_peer(peer_name)
+        if peer_addr is None:
+            raise PeerNotFound(f"Peer '{peer_name}' not found for file PUT")
+        addr, _ = peer_addr
+        peer_info = self._peers.get(peer_name)
+        tcp_port = None
+        if peer_info is not None and peer_info.tcp_port is not None:
+            tcp_port = peer_info.tcp_port
+        else:
+            tcp_port = _node_tcp_port(peer_name, self._realm)
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        s.connect((addr, tcp_port))
+        try:
+            headers = (
+                f"PUT {path} HTTP/1.1\r\n"
+                f"Host: {peer_name}\r\n"
+                f"Content-Length: {len(data)}\r\n"
+                f"\r\n"
+            ).encode("utf-8")
+            s.sendall(headers + data)
+            # Minimal response parsing
+            resp = b""
+            while b"\r\n\r\n" not in resp and len(resp) < 4096:
+                chunk = s.recv(1024)
+                if not chunk:
+                    break
+                resp += chunk
+            if not resp:
+                raise RemoteError("Empty HTTP response to PUT")
+            status_line = resp.splitlines()[0].decode("utf-8", errors="replace")
+            if "200" not in status_line:
+                raise RemoteError(f"HTTP error from peer on PUT: {status_line}")
+        finally:
+            s.close()
+
+    def _handle_http_connection(
+        self,
+        conn: socket.socket,
+        first_line: bytes,
+        initial: bytes,
+    ) -> None:
+        """
+        Minimal HTTP/1.1 handler for GET / PUT with Content-Length.
+        """
+        try:
+            request = initial
+            # Ensure we have full headers
+            while b"\r\n\r\n" not in request and len(request) < 65536:
+                chunk = conn.recv(1024)
+                if not chunk:
+                    break
+                request += chunk
+            head, _, body = request.partition(b"\r\n\r\n")
+            lines = head.splitlines()
+            if not lines:
+                conn.close()
+                return
+            try:
+                req_line = lines[0].decode("utf-8")
+            except Exception:
+                conn.close()
+                return
+            parts = req_line.split()
+            if len(parts) < 2:
+                conn.close()
+                return
+            method, path = parts[0], parts[1]
+            path = path or "/"
+            content_length = 0
+            for line in lines[1:]:
+                try:
+                    text = line.decode("utf-8")
+                except Exception:
+                    continue
+                if text.lower().startswith("content-length:"):
+                    try:
+                        content_length = int(text.split(":", 1)[1].strip())
+                    except ValueError:
+                        pass
+            # Read body if needed
+            while len(body) < content_length:
+                chunk = conn.recv(min(4096, content_length - len(body)))
+                if not chunk:
+                    break
+                body += chunk
+            if method == "GET":
+                self._http_serve_file(conn, path)
+            elif method == "PUT":
+                self._http_receive_file(conn, path, body)
+            else:
+                conn.sendall(b"HTTP/1.1 405 Method Not Allowed\r\n\r\n")
+        except Exception:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def _match_file_root(self, path: str) -> Optional[Tuple[str, str]]:
+        for prefix, root in self._file_roots:
+            if path.startswith(prefix):
+                return prefix, root
+        return None
+
+    def _http_serve_file(self, conn: socket.socket, path: str) -> None:
+        import os
+        from pathlib import Path
+
+        match = self._match_file_root(path)
+        if match is None:
+            conn.sendall(b"HTTP/1.1 404 Not Found\r\n\r\n")
+            conn.close()
+            return
+        prefix, root = match
+        rel = path[len(prefix) :].lstrip("/")
+        fs_path = Path(root) / rel
+        try:
+            fs_path = fs_path.resolve()
+            root_path = Path(root).resolve()
+            if root_path not in fs_path.parents and fs_path != root_path:
+                raise PermissionError("Path traversal outside root")
+            if not fs_path.is_file():
+                raise FileNotFoundError(str(fs_path))
+            data = fs_path.read_bytes()
+        except FileNotFoundError:
+            conn.sendall(b"HTTP/1.1 404 Not Found\r\n\r\n")
+            conn.close()
+            return
+        except PermissionError:
+            conn.sendall(b"HTTP/1.1 403 Forbidden\r\n\r\n")
+            conn.close()
+            return
+        headers = (
+            f"HTTP/1.1 200 OK\r\nContent-Length: {len(data)}\r\n\r\n"
+        ).encode("utf-8")
+        conn.sendall(headers + data)
+        conn.close()
+
+    def _http_receive_file(self, conn: socket.socket, path: str, body: bytes) -> None:
+        from pathlib import Path
+
+        match = self._match_file_root(path)
+        if match is None:
+            conn.sendall(b"HTTP/1.1 404 Not Found\r\n\r\n")
+            conn.close()
+            return
+        prefix, root = match
+        rel = path[len(prefix) :].lstrip("/")
+        fs_path = Path(root) / rel
+        try:
+            fs_path = fs_path.resolve()
+            root_path = Path(root).resolve()
+            if root_path not in fs_path.parents and fs_path != root_path:
+                raise PermissionError("Path traversal outside root")
+            fs_path.parent.mkdir(parents=True, exist_ok=True)
+            fs_path.write_bytes(body)
+        except PermissionError:
+            conn.sendall(b"HTTP/1.1 403 Forbidden\r\n\r\n")
+            conn.close()
+            return
+        headers = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+        conn.sendall(headers)
+        conn.close()
 
     def _on_peer_added(self, mdns_key: str, info: ServiceInfo) -> None:
         # Skip self
@@ -1154,6 +1655,19 @@ class PeerLink:
             instance_id = instance_id.decode("utf-8", errors="replace")
         addr = socket.inet_ntoa(info.addresses[0]) if info.addresses else None
         port = info.port
+        # Optional TCP port for streaming / files. If absent, fall back to UDP port.
+        raw_tcp_port = props.get("tcp_port")
+        if isinstance(raw_tcp_port, bytes):
+            try:
+                raw_tcp_port = raw_tcp_port.decode("utf-8", errors="replace")
+            except Exception:
+                raw_tcp_port = None
+        try:
+            tcp_port: Optional[int] = int(raw_tcp_port) if raw_tcp_port else None
+        except (TypeError, ValueError):
+            tcp_port = None
+        if tcp_port is None:
+            tcp_port = port
         if not addr:
             return
         now = time.time()
@@ -1172,6 +1686,7 @@ class PeerLink:
                 port=port,
                 last_seen=now,
                 instance_id=instance_id if isinstance(instance_id, str) else None,
+                tcp_port=tcp_port,
             )
         self._log(f"👥 Found peer: {peer_name} @ {addr}:{port}")
         if old and (old.addr != addr or old.port != port):

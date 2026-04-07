@@ -1,12 +1,10 @@
 # PeerLink
 
-Zero-config P2P RPC over LAN/WiFi, built on:
+Zero-config P2P RPC and streaming/files over LAN/WiFi.
 
-- mDNS service discovery (via `zeroconf`)
-- UDP transport
-- JSON message framing
-
-PeerLink lets you expose Python functions on one node and call them from another node on the same network with a simple, type-hinted API.
+- mDNS discovery (zeroconf)
+- UDP RPC + datagram channels
+- TCP streams + file transfer (v1.1.1)
 
 ## Installation
 
